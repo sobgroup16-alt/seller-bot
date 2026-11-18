@@ -39,24 +39,32 @@ class Funnel:
 
     def register_lead(self, user_id: int, username: str | None, full_name: str | None,
                       source: str, ts: int | None = None) -> bool:
-        """Человек получил лид-магнит. Ставит отложенные сообщения один раз.
+        """Человек получил лид-магнит. Полный прогрев ставится один раз.
 
-        Возвращает True, если расписание поставлено. Оплату бот не отслеживает:
-        приглашение в канал и прогрев получают все, кто не остановил бота.
+        Сообщение с программой (after_lead) планируется при каждой выдаче видео:
+        раньше оно уходило сразу после каждого ролика. Остальные шаги при повторной
+        выдаче не дублируются. Возвращает True, если поставлен полный план (первый раз).
+        Оплату бот не отслеживает: приглашение в канал и прогрев получают все,
+        кто не остановил бота.
         """
         ts = ts or now_ts()
         self.db.upsert_user(user_id, username, full_name, source, ts=ts)
         self.db.log_event(user_id, f"lead_{source}", source, ts=ts)
-        if self.db.has_schedule(user_id):
-            return False
         delays = {
+            "after_lead": (self.s.program_delay_minutes or 0) / 60,
             "channel_invite": self.s.channel_invite_delay_hours if self.s.channel_url else 0,
             "warmup1": self.s.warmup1_delay_hours,
             "warmup2": self.s.warmup2_delay_hours,
         }
         plan = plan_warmups(from_ts(ts), delays, self.s.timezone, self.s.send_from_hour, self.s.send_to_hour)
-        self.db.schedule(user_id, plan)
-        return bool(plan)
+        if not self.db.has_schedule(user_id):
+            self.db.schedule(user_id, plan)
+            return bool(plan)
+        # Повторная выдача: полный прогрев не дублируем, программу ставим заново.
+        for step, due in plan:
+            if step == "after_lead":
+                self.db.reschedule(user_id, step, due)
+        return False
 
     # ---------- отложенные сообщения ----------
     async def process_due(self, send: Callable[[int, str, str | None], Awaitable[str]],

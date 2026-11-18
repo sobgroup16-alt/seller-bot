@@ -9,9 +9,13 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-# Отложенные шаги в обычном порядке: приглашение в канал (~2 ч), история (~сутки), сомнения (~2,5 дня).
-# Фактический порядок определяется задержками из .env.
-WARMUP_STEPS = ("channel_invite", "warmup1", "warmup2")
+# Отложенные шаги в обычном порядке: программа курса (~10 мин), приглашение в канал (~2 ч),
+# история (~сутки), сомнения (~2,5 дня). Фактический порядок определяется задержками из .env.
+WARMUP_STEPS = ("after_lead", "channel_invite", "warmup1", "warmup2")
+
+# Эти шаги уходят ровно через заданную задержку, даже ночью: человек только что получил видео
+# и ещё в диалоге с ботом. Остальные шаги по-прежнему сдвигаются на утро.
+STEPS_WITHOUT_NIGHT_SHIFT = frozenset({"after_lead"})
 
 
 def normalize(text: str) -> str:
@@ -84,9 +88,9 @@ def plan_warmups(start: datetime, delays_hours: dict[str, float], tz_name: str,
 
     Шаги идут по возрастанию задержки (при равной — в порядке WARMUP_STEPS).
     Шаги с задержкой <= 0 пропускаются (так их можно выключить в .env).
-    Ночное правило применяется к каждому шагу отдельно: время сдвигается
-    на утро, только если само выпало на ночь. Каждый следующий шаг — не раньше
-    предыдущего + 30 минут.
+    Ночное правило применяется к каждому шагу отдельно, кроме шагов из
+    STEPS_WITHOUT_NIGHT_SHIFT: сообщение с программой уходит через 10 минут
+    даже ночью. Каждый следующий шаг — не раньше предыдущего + 30 минут.
     """
     steps = [(delays_hours.get(st, 0) or 0, i, st) for i, st in enumerate(WARMUP_STEPS)]
     plan: list[tuple[str, datetime]] = []
@@ -94,9 +98,14 @@ def plan_warmups(start: datetime, delays_hours: dict[str, float], tz_name: str,
     for hours, _, step in sorted(steps):
         if hours <= 0:
             continue
-        due = shift_into_window(start + timedelta(hours=hours), tz_name, from_hour, to_hour)
+        due = start + timedelta(hours=hours)
+        apply_night = step not in STEPS_WITHOUT_NIGHT_SHIFT
+        if apply_night:
+            due = shift_into_window(due, tz_name, from_hour, to_hour)
         if prev and due <= prev:
-            due = shift_into_window(prev + timedelta(minutes=30), tz_name, from_hour, to_hour)
+            due = prev + timedelta(minutes=30)
+            if apply_night:
+                due = shift_into_window(due, tz_name, from_hour, to_hour)
         plan.append((step, due))
         prev = due
     return plan

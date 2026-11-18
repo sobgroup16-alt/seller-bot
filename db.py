@@ -23,14 +23,14 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS events (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id    INTEGER NOT NULL,
-    kind       TEXT NOT NULL,      -- start, lead_utechki, lead_agent, channel_invite, warmup1, warmup2
+    kind       TEXT NOT NULL,      -- start, lead_utechki, lead_agent, after_lead, channel_invite, warmup1, warmup2
     source     TEXT,
     created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS scheduled (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id   INTEGER NOT NULL,
-    step      TEXT NOT NULL,       -- channel_invite, warmup1, warmup2
+    step      TEXT NOT NULL,       -- after_lead, channel_invite, warmup1, warmup2
     due_at    INTEGER NOT NULL,    -- время отправки (unix, UTC)
     sent_at   INTEGER,
     cancelled INTEGER NOT NULL DEFAULT 0,
@@ -118,6 +118,17 @@ class DB:
         self.conn.executemany(
             "INSERT OR IGNORE INTO scheduled(user_id, step, due_at) VALUES(?,?,?)",
             [(user_id, step, to_ts(due)) for step, due in plan],
+        )
+        self.conn.commit()
+
+    def reschedule(self, user_id: int, step: str, due: datetime) -> None:
+        """Ставит или заново ставит один шаг (сбрасывает sent_at и cancelled)."""
+        self.conn.execute(
+            """INSERT INTO scheduled(user_id, step, due_at, sent_at, cancelled)
+               VALUES(?,?,?,NULL,0)
+               ON CONFLICT(user_id, step) DO UPDATE SET
+                 due_at=excluded.due_at, sent_at=NULL, cancelled=0""",
+            (user_id, step, to_ts(due)),
         )
         self.conn.commit()
 

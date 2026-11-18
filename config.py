@@ -61,7 +61,8 @@ class Settings:
     channel_url: str
     # лендинг курса (оплата только там, через Prodamus; бот оплату не отслеживает)
     landing_url: str
-    # отложенные сообщения (в часах после видео)
+    # отложенные сообщения (после видео)
+    program_delay_minutes: float  # сообщение с программой; 0 = отправить сразу
     channel_invite_delay_hours: float
     warmup1_delay_hours: float
     warmup2_delay_hours: float
@@ -111,6 +112,7 @@ def load_settings(require_token: bool = True) -> Settings:
         lead_agent_file_id=_str("LEAD_AGENT_FILE_ID"),
         channel_url=_str("CHANNEL_URL"),
         landing_url=_str("LANDING_URL"),
+        program_delay_minutes=_float("PROGRAM_DELAY_MINUTES", 10),
         channel_invite_delay_hours=_float("CHANNEL_INVITE_DELAY_HOURS", 2),
         warmup1_delay_hours=_float("WARMUP1_DELAY_HOURS", 24),
         warmup2_delay_hours=_float("WARMUP2_DELAY_HOURS", 60),

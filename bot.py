@@ -104,9 +104,10 @@ class App:
         else:
             log.warning("Не задана ссылка или file_id для лид-магнита %s", source)
             await self.bot.send_message(chat_id, intro + "\n\n" + fmt(self.t["lead_not_ready"]))
-        # сразу после видео: короткий прогрев + кнопка «Посмотреть программу»
-        await self.bot.send_message(chat_id, fmt(self.t["after_lead"], name=self.name(user)),
-                                    reply_markup=self.kb_program(source))
+        # Сообщение с программой: сразу, если PROGRAM_DELAY_MINUTES=0, иначе его отправит планировщик.
+        if self.s.program_delay_minutes <= 0:
+            await self.bot.send_message(chat_id, fmt(self.t["after_lead"], name=self.name(user)),
+                                        reply_markup=self.kb_program(source))
 
     # ---------- отложенные сообщения ----------
     async def send_scheduled(self, user_id: int, step: str, source: str | None) -> str:
@@ -262,6 +263,7 @@ class App:
         lines.append("Переходы на программу курса бот не видит: смотрите их в аналитике сайта по метке src.")
         lines.append("")
         lines.append("Отложенные сообщения отправлены: "
+                     f"программа курса — {st['sent'].get('after_lead', 0)}, "
                      f"приглашение в канал — {st['sent'].get('channel_invite', 0)}, "
                      f"прогрев 1 — {st['sent'].get('warmup1', 0)}, "
                      f"прогрев 2 — {st['sent'].get('warmup2', 0)}")
