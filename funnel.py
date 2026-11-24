@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from typing import Awaitable, Callable
 
 from config import Settings
-from db import DB, from_ts, now_ts
+from db import DB, PROMO_STEPS, from_ts, now_ts
 from logic import build_word_index, parse_code_word, parse_start_payload, plan_warmups
 
 log = logging.getLogger("funnel")
@@ -44,8 +44,8 @@ class Funnel:
         Сообщение с программой (after_lead) планируется при каждой выдаче видео:
         раньше оно уходило сразу после каждого ролика. Остальные шаги при повторной
         выдаче не дублируются. Возвращает True, если поставлен полный план (первый раз).
-        Оплату бот не отслеживает: приглашение в канал и прогрев получают все,
-        кто не остановил бота.
+        Оплату бот не отслеживает. Сообщение с программой ставится всем, кто взял видео.
+        Приглашение в канал и прогрев — только при согласии на рассылку (mailing_consent = 1).
         """
         ts = ts or now_ts()
         self.db.upsert_user(user_id, username, full_name, source, ts=ts)
@@ -57,6 +57,8 @@ class Funnel:
             "warmup2": self.s.warmup2_delay_hours,
         }
         plan = plan_warmups(from_ts(ts), delays, self.s.timezone, self.s.send_from_hour, self.s.send_to_hour)
+        if not self.db.mailing_allowed(user_id):
+            plan = [(step, due) for step, due in plan if step not in PROMO_STEPS]
         if not self.db.has_schedule(user_id):
             self.db.schedule(user_id, plan)
             return bool(plan)

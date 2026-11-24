@@ -54,6 +54,34 @@ def parse_code_word(text: str, word_index: dict[str, str]) -> str | None:
     return None
 
 
+def telegram_command(text: str | None) -> tuple[str | None, str | None]:
+    """Разбирает команду Telegram: '/start@bot utechki' → ('/start', 'utechki').
+
+    Имя команды в нижнем регистре. Если это не команда — (None, None).
+    """
+    raw = (text or "").strip()
+    if not raw.startswith("/"):
+        return None, None
+    head, _, arg = raw.partition(" ")
+    name = head.split("@", 1)[0].casefold()
+    if not re.fullmatch(r"/[a-z0-9_]+", name):
+        return None, None
+    arg = arg.strip()
+    return name, (arg or None)
+
+
+def consent_stage(pd_consent: int | None, mailing_consent: int | None) -> str:
+    """На каком шаге согласий человек: 'pd', 'mailing' или 'done'.
+
+    mailing_consent 0 — это уже ответ («только материал» или /stop), шаг не повторяем.
+    """
+    if pd_consent != 1:
+        return "pd"
+    if mailing_consent is None:
+        return "mailing"
+    return "done"
+
+
 def parse_start_payload(payload: str | None, word_index: dict[str, str]) -> str | None:
     """Разбирает хвост ссылки t.me/бот?start=utechki → 'utechki'."""
     if not payload:

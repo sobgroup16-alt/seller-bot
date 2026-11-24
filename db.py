@@ -1,7 +1,8 @@
 """База данных SQLite: пользователи, события, очередь отложенных сообщений и журнал рассылок.
 
 Очередь хранится в базе, поэтому после перезапуска бота ничего не теряется.
-Оплату бот не отслеживает: курс оплачивается на лендинге, прогрев получают все.
+Оплату бот не отслеживает: курс оплачивается на лендинге.
+Прогрев и рассылку получают только те, кто согласился на рассылку и не остановил бота.
 """
 from __future__ import annotations
 
@@ -18,12 +19,17 @@ CREATE TABLE IF NOT EXISTS users (
     source      TEXT,              -- первое кодовое слово, с которым пришёл человек
     last_source TEXT,              -- последнее кодовое слово
     created_at  INTEGER NOT NULL,
-    blocked     INTEGER NOT NULL DEFAULT 0   -- 1 = человек остановил бота, ему не пишем
+    blocked     INTEGER NOT NULL DEFAULT 0,  -- 1 = человек остановил бота, ему не пишем
+    pd_consent         INTEGER,   -- 1 = согласие на обработку персональных данных
+    pd_consent_at      INTEGER,   -- unix UTC, когда согласился (первый раз, не перезаписывается)
+    mailing_consent    INTEGER,   -- 1 = можно слать рассылку, 0 = отказ или /stop, NULL = ещё не ответил
+    mailing_consent_at INTEGER,   -- unix UTC, когда принято текущее решение по рассылке
+    pending_source     TEXT       -- utechki / agent, параметр запуска до конца согласий
 );
 CREATE TABLE IF NOT EXISTS events (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id    INTEGER NOT NULL,
-    kind       TEXT NOT NULL,      -- start, lead_utechki, lead_agent, after_lead, channel_invite, warmup1, warmup2
+    kind       TEXT NOT NULL,      -- start, lead_*, after_lead, channel_invite, warmup*, pd_consent, mailing_yes, mailing_no, mailing_stop
     source     TEXT,
     created_at INTEGER NOT NULL
 );
@@ -54,6 +60,9 @@ CREATE TABLE IF NOT EXISTS broadcasts (
 """
 
 AUDIENCES = ("all", "utechki", "agent")
+# Приглашение в канал и прогрев — рекламные сообщения. Сообщение с программой (after_lead)
+# к ним не относится: это продолжение выдачи материала через 10 минут.
+PROMO_STEPS = ("channel_invite", "warmup1", "warmup2")
 
 
 def now_ts() -> int:
@@ -76,7 +85,22 @@ class DB:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
+        self._ensure_user_columns()
         self.conn.commit()
+
+    def _ensure_user_columns(self) -> None:
+        """Старые базы (до экрана согласий) получают новые поля без потери людей."""
+        have = {row[1] for row in self.conn.execute("PRAGMA table_info(users)")}
+        adds = (
+            ("pd_consent", "ALTER TABLE users ADD COLUMN pd_consent INTEGER"),
+            ("pd_consent_at", "ALTER TABLE users ADD COLUMN pd_consent_at INTEGER"),
+            ("mailing_consent", "ALTER TABLE users ADD COLUMN mailing_consent INTEGER"),
+            ("mailing_consent_at", "ALTER TABLE users ADD COLUMN mailing_consent_at INTEGER"),
+            ("pending_source", "ALTER TABLE users ADD COLUMN pending_source TEXT"),
+        )
+        for name, sql in adds:
+            if name not in have:
+                self.conn.execute(sql)
 
     # ---------- пользователи ----------
     def upsert_user(self, user_id: int, username: str | None, full_name: str | None,
@@ -95,8 +119,79 @@ class DB:
         )
         self.conn.commit()
 
+    def ensure_user(self, user_id: int, username: str | None, full_name: str | None,
+                    ts: int | None = None) -> None:
+        """Создаёт человека, если его ещё нет. Не снимает блокировку и не меняет источник."""
+        ts = ts or now_ts()
+        self.conn.execute(
+            """INSERT INTO users(user_id, username, full_name, created_at)
+               VALUES(?,?,?,?)
+               ON CONFLICT(user_id) DO UPDATE SET
+                 username=excluded.username,
+                 full_name=excluded.full_name""",
+            (user_id, username, full_name, ts),
+        )
+        self.conn.commit()
+
     def get_user(self, user_id: int) -> sqlite3.Row | None:
         return self.conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
+
+    def set_pd_consent(self, user_id: int, ts: int | None = None) -> None:
+        """Согласие на ПДн. Время первого согласия не перезаписывается."""
+        ts = ts or now_ts()
+        self.conn.execute(
+            """UPDATE users SET pd_consent=1, pd_consent_at=COALESCE(pd_consent_at, ?)
+               WHERE user_id=?""",
+            (ts, user_id),
+        )
+        self.conn.commit()
+
+    def set_mailing_consent(self, user_id: int, agreed: bool, ts: int | None = None) -> None:
+        """Текущее решение по рассылке и время этого решения.
+
+        Согласие (agreed=True) заодно снимает блокировку: человек сам попросил писать ему.
+        Отказ и /stop блокировку не ставят — материалы и ответы бота остаются.
+        """
+        ts = ts or now_ts()
+        if agreed:
+            self.conn.execute(
+                "UPDATE users SET mailing_consent=1, mailing_consent_at=?, blocked=0 WHERE user_id=?",
+                (ts, user_id),
+            )
+        else:
+            self.conn.execute(
+                "UPDATE users SET mailing_consent=0, mailing_consent_at=? WHERE user_id=?",
+                (ts, user_id),
+            )
+        self.conn.commit()
+
+    def mailing_allowed(self, user_id: int) -> bool:
+        row = self.get_user(user_id)
+        return bool(row and row["mailing_consent"] == 1)
+
+    def set_pending_source(self, user_id: int, source: str) -> None:
+        self.conn.execute("UPDATE users SET pending_source=? WHERE user_id=?", (source, user_id))
+        self.conn.commit()
+
+    def get_pending_source(self, user_id: int) -> str | None:
+        row = self.get_user(user_id)
+        if not row:
+            return None
+        return row["pending_source"]
+
+    def clear_pending_source(self, user_id: int) -> None:
+        self.conn.execute("UPDATE users SET pending_source=NULL WHERE user_id=?", (user_id,))
+        self.conn.commit()
+
+    def has_event(self, user_id: int, kind: str) -> bool:
+        return self.conn.execute(
+            "SELECT 1 FROM events WHERE user_id=? AND kind=? LIMIT 1", (user_id, kind)
+        ).fetchone() is not None
+
+    def has_lead(self, user_id: int) -> bool:
+        return self.conn.execute(
+            "SELECT 1 FROM events WHERE user_id=? AND kind LIKE 'lead_%' LIMIT 1", (user_id,)
+        ).fetchone() is not None
 
     def mark_blocked(self, user_id: int) -> None:
         self.conn.execute("UPDATE users SET blocked=1 WHERE user_id=?", (user_id,))
@@ -138,15 +233,32 @@ class DB:
         )
         self.conn.commit()
 
+    def cancel_promo(self, user_id: int) -> None:
+        """Снимает ещё не отправленные прогрев и приглашение в канал. Программу курса не трогает."""
+        marks = ",".join("?" * len(PROMO_STEPS))
+        self.conn.execute(
+            f"""UPDATE scheduled SET cancelled=1
+                WHERE user_id=? AND sent_at IS NULL AND step IN ({marks})""",
+            (user_id, *PROMO_STEPS),
+        )
+        self.conn.commit()
+
     def due_messages(self, ts: int | None = None, limit: int = 50) -> list[sqlite3.Row]:
-        """Сообщения, которым пора уйти. Тем, кто остановил бота, не отдаём."""
+        """Сообщения, которым пора уйти.
+
+        Тем, кто остановил бота, не отдаём. Прогрев и приглашение в канал не отдаём,
+        пока mailing_consent не равен 1. Такие строки не занимают лимит выборки:
+        иначе очередь из несогласившихся остановила бы сообщение с программой.
+        """
+        marks = ",".join("?" * len(PROMO_STEPS))
         return self.conn.execute(
-            """SELECT s.id, s.user_id, s.step, u.source, u.last_source
+            f"""SELECT s.id, s.user_id, s.step, u.source, u.last_source
                FROM scheduled s JOIN users u ON u.user_id = s.user_id
                WHERE s.sent_at IS NULL AND s.cancelled = 0 AND s.due_at <= ?
                  AND u.blocked = 0
+                 AND (s.step NOT IN ({marks}) OR u.mailing_consent = 1)
                ORDER BY s.due_at, s.id LIMIT ?""",
-            (ts or now_ts(), limit),
+            (ts or now_ts(), *PROMO_STEPS, limit),
         ).fetchall()
 
     def mark_sent(self, sched_id: int, ts: int | None = None) -> None:
@@ -159,16 +271,21 @@ class DB:
 
     # ---------- рассылка ----------
     def broadcast_recipients(self, audience: str = "all") -> list[int]:
-        """Кому уйдёт рассылка: все, кто запускал бота и не остановил его.
+        """Кому уйдёт рассылка: согласие на рассылку есть, бота не остановил.
 
+        Старые пользователи без mailing_consent сюда не попадают.
         utechki / agent — те, кто хоть раз получал это видео (человек, взявший оба, есть в обоих).
         """
         if audience == "all":
-            rows = self.conn.execute("SELECT user_id FROM users WHERE blocked=0 ORDER BY created_at, user_id")
+            rows = self.conn.execute(
+                """SELECT user_id FROM users
+                   WHERE blocked=0 AND mailing_consent=1
+                   ORDER BY created_at, user_id"""
+            )
         elif audience in AUDIENCES:
             rows = self.conn.execute(
                 """SELECT u.user_id FROM users u
-                   WHERE u.blocked=0 AND (u.source=? OR u.last_source=? OR EXISTS(
+                   WHERE u.blocked=0 AND u.mailing_consent=1 AND (u.source=? OR u.last_source=? OR EXISTS(
                        SELECT 1 FROM events e WHERE e.user_id=u.user_id AND e.kind=?))
                    ORDER BY u.created_at, u.user_id""",
                 (audience, audience, f"lead_{audience}"),

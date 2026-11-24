@@ -1,6 +1,9 @@
 """Telegram-бот Елены Тимошенко: лид-магниты по кодовым словам, ссылка на программу курса,
 приглашение в канал, прогрев и рассылка по базе.
 
+Перед материалом бот спрашивает согласие на обработку персональных данных и на рассылку.
+Прогрев и рассылку получают только те, кто нажал «Да, присылайте».
+
 Оплаты в боте нет: курс оплачивается на лендинге (Prodamus), бот оплату не отслеживает.
 
 Запуск: python main.py   (или ./run.sh — с автоперезапуском и логом)
@@ -12,7 +15,7 @@ import html
 import logging
 from datetime import datetime
 
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
@@ -23,6 +26,7 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
+    TelegramObject,
     User,
 )
 from zoneinfo import ZoneInfo
@@ -31,7 +35,7 @@ from broadcast import run_broadcast
 from config import Settings, load_settings
 from db import AUDIENCES, DB
 from funnel import Funnel
-from logic import landing_link, parse_button_line, strip_last_line
+from logic import consent_stage, landing_link, parse_button_line, strip_last_line, telegram_command
 from texts import fmt, load_texts
 
 log = logging.getLogger("bot")
@@ -39,6 +43,10 @@ log = logging.getLogger("bot")
 # Ошибки Telegram, после которых человеку больше не пишем
 GONE_MARKERS = ("chat not found", "user is deactivated", "bot was blocked", "user not found",
                 "peer_id_invalid", "bot can't initiate conversation")
+
+CB_PD = "consent:pd"
+CB_MAIL_YES = "consent:mail:yes"
+CB_MAIL_NO = "consent:mail:no"
 
 
 class App:
@@ -83,6 +91,101 @@ class App:
     @staticmethod
     def name(user: User) -> str:
         return html.escape(user.first_name or "Здравствуйте")
+
+    # ---------- согласия ----------
+    def kb_pd(self) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text=self.t["buttons"]["pd_consent"], callback_data=CB_PD),
+        ]])
+
+    def kb_mailing(self) -> InlineKeyboardMarkup:
+        buttons = self.t["buttons"]
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=buttons["mailing_yes"], callback_data=CB_MAIL_YES)],
+            [InlineKeyboardButton(text=buttons["mailing_no"], callback_data=CB_MAIL_NO)],
+        ])
+
+    def stage_of(self, user_id: int) -> str:
+        row = self.db.get_user(user_id)
+        if row is None:
+            return "pd"
+        return consent_stage(row["pd_consent"], row["mailing_consent"])
+
+    def note_user(self, user: User) -> None:
+        self.db.ensure_user(user.id, user.username, user.full_name)
+
+    def requested_source(self, text: str | None = None, callback_data: str | None = None) -> str | None:
+        """Какой материал просили, пока согласия не закончены. None — не затирать уже сохранённое."""
+        if callback_data and callback_data.startswith("lead:"):
+            tag = callback_data.split(":", 1)[1]
+            return tag if tag in self.t["sources"] else None
+        name, arg = telegram_command(text)
+        if name == "/start":
+            return self.funnel.source_from_start(arg)
+        if name:
+            return None
+        return self.funnel.source_from_text(text)
+
+    def prepare_incoming(self, user: User, text: str | None = None,
+                         callback_data: str | None = None) -> str:
+        """Запоминает человека и параметр запуска, если согласия ещё не пройдены."""
+        stage = self.stage_of(user.id)
+        if stage == "done":
+            return stage
+        self.note_user(user)
+        source = self.requested_source(text, callback_data)
+        if source:
+            self.db.set_pending_source(user.id, source)
+        return stage
+
+    async def show_pd(self, chat_id: int) -> None:
+        await self.bot.send_message(chat_id, fmt(self.t["consent"]["pd"]), reply_markup=self.kb_pd())
+
+    async def show_mailing(self, chat_id: int) -> None:
+        await self.bot.send_message(chat_id, fmt(self.t["consent"]["mailing"]), reply_markup=self.kb_mailing())
+
+    def accept_pd(self, user_id: int) -> bool:
+        row = self.db.get_user(user_id)
+        if row and row["pd_consent"] == 1:
+            return False
+        self.db.set_pd_consent(user_id)
+        self.db.log_event(user_id, "pd_consent")
+        log.info("Согласие на обработку ПДн: user_id=%s", user_id)
+        return True
+
+    def accept_mailing(self, user_id: int, agreed: bool) -> None:
+        self.db.set_mailing_consent(user_id, agreed)
+        if not agreed:
+            self.db.cancel_promo(user_id)
+        self.db.log_event(user_id, "mailing_yes" if agreed else "mailing_no")
+        log.info("Решение по рассылке: user_id=%s agreed=%s", user_id, agreed)
+
+    def unsubscribe(self, user_id: int) -> None:
+        self.db.set_mailing_consent(user_id, False)
+        self.db.cancel_promo(user_id)
+        self.db.log_event(user_id, "mailing_stop")
+        log.info("Отписка /stop: user_id=%s", user_id)
+
+    def _already_in_funnel(self, user_id: int) -> bool:
+        return self.db.has_event(user_id, "start") or self.db.has_lead(user_id)
+
+    async def finish_and_deliver(self, chat_id: int, user: User) -> None:
+        """После согласий выдаёт сохранённый материал. Без параметра новому человеку — меню /start.
+
+        Кто уже был в боте и новый материал не просил, повторное меню не получает.
+        Параметр запуска стирается только после успешной выдачи.
+        """
+        source = self.db.get_pending_source(user.id)
+        if source not in self.t["sources"]:
+            source = None
+        started = self._already_in_funnel(user.id)
+        if source or not started:
+            self.funnel.register_start(user.id, user.username, user.full_name, source)
+        if source:
+            await self.deliver_lead(chat_id, user, source)
+        elif not started:
+            await self.bot.send_message(chat_id, fmt(self.t["welcome"]), reply_markup=self.kb_choice())
+        self.db.clear_pending_source(user.id)
 
     def lead_assets(self, source: str) -> tuple[str, str]:
         if source == "utechki":
@@ -279,6 +382,74 @@ class App:
         return "\n".join(lines)
 
 
+def _callback_chat_id(cb: CallbackQuery) -> int:
+    message = cb.message
+    if message is not None and getattr(message, "chat", None) is not None:
+        return message.chat.id
+    return cb.from_user.id
+
+
+async def _ack(cb: CallbackQuery) -> None:
+    try:
+        await cb.answer()
+    except RuntimeError:
+        log.debug("Не удалось ответить на callback: нет контекста бота")
+
+
+async def _drop_markup(cb: CallbackQuery) -> None:
+    message = cb.message
+    if message is None or not hasattr(message, "edit_reply_markup"):
+        return
+    try:
+        await message.edit_reply_markup(reply_markup=None)
+    except (TelegramBadRequest, RuntimeError):
+        pass
+
+
+class ConsentMiddleware(BaseMiddleware):
+    """До согласия на ПДн любое сообщение и любая команда снова показывают шаг 1.
+
+    /stop проходит всегда: отписка не ждёт анкету.
+    Шаг про рассылку тоже обязателен, материал уходит только после ответа на него.
+    """
+
+    def __init__(self, app: App):
+        self.app = app
+
+    async def __call__(self, handler, event: TelegramObject, data: dict):
+        if isinstance(event, Message):
+            if event.from_user is None:
+                return await handler(event, data)
+            name, _arg = telegram_command(event.text)
+            if name == "/stop":
+                return await handler(event, data)
+            text = event.text if event.text is not None else event.caption
+            stage = self.app.prepare_incoming(event.from_user, text=text)
+            if stage == "done":
+                return await handler(event, data)
+            if stage == "pd":
+                await self.app.show_pd(event.chat.id)
+            else:
+                await self.app.show_mailing(event.chat.id)
+            return None
+        if isinstance(event, CallbackQuery):
+            if (event.data or "").startswith("consent:"):
+                return await handler(event, data)
+            if event.from_user is None:
+                return await handler(event, data)
+            stage = self.app.prepare_incoming(event.from_user, callback_data=event.data)
+            if stage == "done":
+                return await handler(event, data)
+            await _ack(event)
+            chat_id = _callback_chat_id(event)
+            if stage == "pd":
+                await self.app.show_pd(chat_id)
+            else:
+                await self.app.show_mailing(chat_id)
+            return None
+        return await handler(event, data)
+
+
 def build_router(app: App) -> Router:
     r = Router()
     t = app.t
@@ -286,13 +457,28 @@ def build_router(app: App) -> Router:
 
     @r.message(CommandStart())
     async def on_start(message: Message, command: CommandObject):
+        # Сюда попадаем только после обоих согласий: до этого экран согласий перехватывает /start.
         user = message.from_user
         source = app.funnel.source_from_start(command.args)
+        app.db.clear_pending_source(user.id)
         app.funnel.register_start(user.id, user.username, user.full_name, source)
         if source:
             await app.deliver_lead(message.chat.id, user, source)
         else:
             await message.answer(fmt(t["welcome"]), reply_markup=app.kb_choice())
+
+    @r.message(Command("stop"))
+    async def on_stop(message: Message):
+        user = message.from_user
+        if user is None:
+            return
+        # На шаге 2 /stop — это отказ от рассылки, материал после него всё равно выдаём.
+        waiting_material = app.stage_of(user.id) == "mailing"
+        app.note_user(user)
+        app.unsubscribe(user.id)
+        await message.answer(fmt(t["consent"]["unsubscribed"]))
+        if waiting_material:
+            await app.finish_and_deliver(message.chat.id, user)
 
     @r.message(Command("myid"))
     async def on_myid(message: Message):
@@ -372,6 +558,42 @@ def build_router(app: App) -> Router:
         else:
             await cb.answer()
 
+    # ----- согласия -----
+    @r.callback_query(F.data == CB_PD)
+    async def on_pd_consent(cb: CallbackQuery):
+        user = cb.from_user
+        app.note_user(user)
+        app.accept_pd(user.id)
+        await _ack(cb)
+        await _drop_markup(cb)
+        chat_id = _callback_chat_id(cb)
+        if app.stage_of(user.id) == "mailing":
+            await app.show_mailing(chat_id)
+        else:
+            await app.finish_and_deliver(chat_id, user)
+
+    @r.callback_query(F.data.in_((CB_MAIL_YES, CB_MAIL_NO)))
+    async def on_mailing_choice(cb: CallbackQuery):
+        user = cb.from_user
+        app.note_user(user)
+        chat_id = _callback_chat_id(cb)
+        if app.stage_of(user.id) == "pd":
+            await _ack(cb)
+            await app.show_pd(chat_id)
+            return
+        row = app.db.get_user(user.id)
+        already = row is not None and row["mailing_consent"] is not None
+        pending = row["pending_source"] if row else None
+        if already and not pending and app._already_in_funnel(user.id):
+            await _ack(cb)
+            await _drop_markup(cb)
+            return
+        if not already:
+            app.accept_mailing(user.id, cb.data == CB_MAIL_YES)
+        await _ack(cb)
+        await _drop_markup(cb)
+        await app.finish_and_deliver(chat_id, user)
+
     # ----- воронка -----
     @r.callback_query(F.data.startswith("lead:"))
     async def on_lead_button(cb: CallbackQuery):
@@ -399,6 +621,9 @@ def build_router(app: App) -> Router:
         else:
             await message.answer(fmt(t["unknown"]), reply_markup=app.kb_choice())
 
+    gate = ConsentMiddleware(app)
+    r.message.outer_middleware(gate)
+    r.callback_query.outer_middleware(gate)
     return r
 
 
@@ -424,7 +649,10 @@ async def main() -> None:
     me = await bot.get_me()
     log.info("Бот @%s запущен. Ссылки: https://t.me/%s?start=utechki и https://t.me/%s?start=agent",
              me.username, me.username, me.username)
-    await bot.set_my_commands([BotCommand(command="start", description="Начать")])
+    await bot.set_my_commands([
+        BotCommand(command="start", description="Начать"),
+        BotCommand(command="stop", description="Отписаться от рассылки"),
+    ])
     await bot.delete_webhook(drop_pending_updates=False)  # работаем через long polling
 
     scheduler = asyncio.create_task(app.scheduler_loop())
