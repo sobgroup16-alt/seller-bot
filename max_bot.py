@@ -686,27 +686,32 @@ async def main() -> None:
     log.info("База MAX: %s", db_path)
     api = MaxClient(settings.max_bot_token)
     app = MaxApp(settings, texts, db, api)
+    scheduler: asyncio.Task | None = None
     try:
-        me = await api.get_me()
-    except MaxApiError as err:
-        await api.close()
-        raise SystemExit(f"MAX не принял токен: {err}") from err
-    username = me.get("username") or me.get("name") or ""
-    if username:
-        log.info(
-            "Бот MAX @%s запущен. Ссылки: https://max.ru/%s?start=utechki и https://max.ru/%s?start=agent",
-            username, username, username,
-        )
-    else:
-        log.info("Бот MAX запущен (ник в ответе /me не пришёл)")
-    if not settings.landing_url:
-        log.warning("LANDING_URL не задан: кнопка «Посмотреть программу» не показывается")
-    marker_path = Path(str(db_path) + ".marker")
-    scheduler = asyncio.create_task(app.scheduler_loop())
-    try:
+        try:
+            me = await api.get_me()
+        except MaxApiError as err:
+            raise SystemExit(f"MAX не принял токен: {err}") from err
+        username = me.get("username") or me.get("name") or ""
+        if username:
+            log.info(
+                "Бот MAX @%s запущен. Ссылки: https://max.ru/%s?start=utechki и https://max.ru/%s?start=agent",
+                username, username, username,
+            )
+        else:
+            log.info("Бот MAX запущен (ник в ответе /me не пришёл)")
+        if not settings.landing_url:
+            log.warning("LANDING_URL не задан: кнопка «Посмотреть программу» не показывается")
+        marker_path = Path(str(db_path) + ".marker")
+        scheduler = asyncio.create_task(app.scheduler_loop())
         await app.poll_forever(marker_path)
     finally:
-        scheduler.cancel()
+        if scheduler is not None:
+            scheduler.cancel()
+            try:
+                await scheduler
+            except asyncio.CancelledError:
+                pass
         await api.close()
 
 

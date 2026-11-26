@@ -14,11 +14,24 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import ssl
+from pathlib import Path
 from typing import Any, Awaitable, Callable
+
+import certifi
 
 log = logging.getLogger("max_api")
 
 API_BASE = "https://platform-api2.max.ru"
+# Сертификаты Минцифры с Госуслуг (gu-st.ru). Их нет в наборе certifi,
+# без них aiohttp не может проверить TLS platform-api2.max.ru.
+# Отпечатки SHA-256 сверены при добавлении в репозиторий.
+CERT_DIR = Path(__file__).resolve().parent / "certs"
+RUSSIAN_CA_FILES = (
+    "russian_trusted_root_ca.pem",       # Russian Trusted Root CA, до 2032-02-27
+    "russian_trusted_sub_ca.pem",         # Russian Trusted Sub CA, 2022–2027
+    "russian_trusted_sub_ca_2024.pem",    # Russian Trusted Sub CA, выпускает *.max.ru
+)
 # Официально: не больше 30 запросов в секунду на platform-api2.max.ru
 # и не больше 2 сообщений в секунду в один диалог.
 MAX_RPS = 30
@@ -68,11 +81,22 @@ def inline_keyboard(rows: list[list[dict]]) -> list[dict]:
     return [{"type": "inline_keyboard", "payload": {"buttons": rows}}]
 
 
+def build_ssl_context() -> ssl.SSLContext:
+    """Доверие certifi плюс корневой и промежуточные УЦ Минцифры. Проверка не отключается."""
+    context = ssl.create_default_context(cafile=certifi.where())
+    for name in RUSSIAN_CA_FILES:
+        context.load_verify_locations(cafile=str(CERT_DIR / name))
+    context.verify_mode = ssl.CERT_REQUIRED
+    context.check_hostname = True
+    return context
+
+
 class MaxClient:
     def __init__(self, token: str, *, base_url: str = API_BASE, transport: Transport | None = None):
         self.token = token
         self.base_url = base_url.rstrip("/")
         self.transport = transport
+        self.ssl_context = None if transport is not None else build_ssl_context()
         self._session = None
 
     async def close(self) -> None:
@@ -93,9 +117,13 @@ class MaxClient:
                     headers: dict) -> tuple[int, Any]:
         import aiohttp
 
-        timeout = aiohttp.ClientTimeout(total=40 if path != "/updates" else 100)
+        # Дольше long polling (до 90 с по документации), одна сессия на все запросы.
+        timeout = aiohttp.ClientTimeout(total=120)
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(timeout=timeout)
+            connector = aiohttp.TCPConnector(ssl=self.ssl_context or build_ssl_context())
+            self._session = aiohttp.ClientSession(
+                timeout=timeout, connector=connector, connector_owner=True,
+            )
         url = self.base_url + path
         req_headers = dict(headers)
         if body is not None:
