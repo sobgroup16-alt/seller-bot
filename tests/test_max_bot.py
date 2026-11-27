@@ -279,6 +279,8 @@ def test_start_without_payload_shows_choice_after_consent():
         await app.handle_update(callback(CB_PD))
         await app.handle_update(callback(CB_MAIL_YES))
         assert "Что вам прислать?" in texts_of(rec)[-1]
+        assert "Здравствуйте! Я бот Елены Тимошенко" not in texts_of(rec)[-1]
+        assert texts_of(rec)[-1].startswith("Помогаю селлерам WB и Ozon")
         assert buttons_of(rec)[-1][0][0]["payload"] == "lead:utechki"
 
     asyncio.run(run())
