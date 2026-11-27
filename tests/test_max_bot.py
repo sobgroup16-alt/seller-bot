@@ -129,10 +129,11 @@ def test_client_sends_token_only_in_header_and_html_message():
         assert call["params"]["disable_link_preview"] == "true"
         assert call["body"]["format"] == "html"
         assert call["body"]["text"] == "<b>Привет</b>"
-        await api.get_updates(marker=None, types=["bot_started"])
+        await api.get_updates(marker=None, types=["bot_started", "message_callback"])
         polling = rec.calls[1]
         assert "marker" not in polling["params"]
-        assert polling["params"]["types"] == ["bot_started"]
+        assert polling["params"]["types"] == "bot_started,message_callback"
+        assert "message_callback" in polling["params"]["types"]
         await api.get_updates(marker=15)
         assert rec.calls[2]["params"]["marker"] == 15
 
@@ -381,6 +382,27 @@ def test_keep_webhooks_env_does_not_delete(monkeypatch, caplog):
     assert api.subs == ["https://example.com/hook"]
     assert "MAX_KEEP_WEBHOOKS=1" in caplog.text
     assert "У бота есть Webhook" in caplog.text
+
+
+def test_button_press_without_callback_user_still_opens_the_next_step():
+    """Реальный message_callback: sender — бот, человек в recipient."""
+
+    async def run():
+        app, rec = make_app()
+        await app.handle_update(started())
+        await app.handle_update({
+            "update_type": "message_callback",
+            "callback": {"callback_id": "cb-real", "payload": CB_PD},
+            "message": {
+                "sender": {"user_id": 999, "first_name": "Bot", "is_bot": True},
+                "recipient": {"chat_id": 7, "chat_type": "dialog", "user_id": 7},
+            },
+        })
+        assert app.db.get_user(7)["pd_consent"] == 1
+        assert "soglasie-rassylka" in texts_of(rec)[-1]
+        assert any(call["path"] == "/answers" and call["params"]["callback_id"] == "cb-real" for call in rec.calls)
+
+    asyncio.run(run())
 
 
 def test_document_links_stay_on_consent_screens():

@@ -285,7 +285,9 @@ class MaxApp:
             buttons = self.kb_url(self.t["buttons"]["channel"], self.s.channel_url)
         else:
             buttons = self.kb_program(source)
-        return await self.send(user_id, text, buttons)
+        result = await self.send(user_id, text, buttons)
+        log.info("Отложенное %s → %s: %s", step, user_id, result)
+        return result
 
     async def scheduler_loop(self) -> None:
         log.info("Планировщик MAX запущен (проверка каждые %s с)", self.s.scheduler_interval_seconds)
@@ -300,7 +302,8 @@ class MaxApp:
 
     # ---------- события ----------
     async def handle_update(self, update: dict) -> None:
-        kind = update.get("update_type")
+        kind = update.get("update_type") or "unknown"
+        log.info("Событие %s", kind)
         if kind == "bot_started":
             await self.on_started(update)
         elif kind == "bot_stopped":
@@ -379,15 +382,17 @@ class MaxApp:
 
     async def on_callback(self, update: dict) -> None:
         callback = update.get("callback") or {}
-        user = person_from(callback.get("user"))
-        payload = callback.get("payload") or ""
+        user = _callback_user(update)
+        payload = str(callback.get("payload") or callback.get("data") or "")
         callback_id = callback.get("callback_id")
+        log.info("Нажата кнопка payload=%s user=%s", payload or "—", getattr(user, "id", None))
         if callback_id:
             try:
                 await self.api.answer_callback(str(callback_id))
             except MaxApiError as err:
                 log.warning("Не удалось ответить на callback %s: %s", callback_id, err)
         if user is None:
+            log.warning("Нажатие без пользователя, ключи callback: %s", sorted(callback))
             return
         if payload == CB_PD:
             await self.on_pd(user)
@@ -652,6 +657,7 @@ class MaxApp:
 
     async def poll_forever(self, marker_path: Path) -> None:
         marker = _read_marker(marker_path)
+        log.info("Long polling, types=%s", ",".join(UPDATE_TYPES))
         await self.prepare_updates()
         while True:
             try:
@@ -667,7 +673,10 @@ class MaxApp:
                 log.exception("Long polling оборвался")
                 await asyncio.sleep(3)
                 continue
-            for update in page.get("updates") or []:
+            updates = page.get("updates") or []
+            if updates:
+                log.info("Получено событий: %s, marker=%s", len(updates), page.get("marker"))
+            for update in updates:
                 try:
                     await self.handle_update(update)
                 except Exception:  # noqa: BLE001
@@ -675,6 +684,19 @@ class MaxApp:
             if page.get("marker") is not None:
                 marker = page["marker"]
                 _write_marker(marker_path, marker)
+
+
+def _callback_user(update: dict) -> SimpleNamespace | None:
+    """Кто нажал кнопку. В message.sender при этом сам бот, человек — в callback.user."""
+    callback = update.get("callback") or {}
+    user = person_from(callback.get("user"))
+    if user is not None:
+        return user
+    recipient = ((update.get("message") or {}).get("recipient") or {})
+    user_id = recipient.get("user_id")
+    if user_id in (None, ""):
+        return None
+    return person_from({"user_id": user_id, "is_bot": False, "name": recipient.get("name")})
 
 
 def _keep_webhooks() -> bool:

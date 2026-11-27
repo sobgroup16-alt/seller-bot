@@ -181,8 +181,10 @@ class MaxClient:
         params: dict[str, Any] = {"timeout": timeout, "limit": limit}
         if marker is not None:
             params["marker"] = marker
+        # MAX читает types как одну строку. Повтор query-параметра оставляет только
+        # первое значение (у нас это bot_started), и message_callback не приходит.
         if types:
-            params["types"] = types
+            params["types"] = ",".join(types)
         data = await self.request("GET", "/updates", params=params)
         return data if isinstance(data, dict) else {"updates": [], "marker": marker}
 
