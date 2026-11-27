@@ -73,6 +73,10 @@ class Settings:
     # рассылка: сколько сообщений в секунду (Telegram разрешает ~30, держимся ниже)
     broadcast_rate_per_sec: float = 15.0
     db_path: Path = field(default_factory=lambda: BASE_DIR / "data" / "bot.sqlite3")
+    # Бот MAX. Пустые значения не влияют на Telegram-бота.
+    max_bot_token: str = ""
+    max_admin_ids: list[int] = field(default_factory=list)
+    max_db_path: Path | None = None
 
 
 def load_settings(require_token: bool = True) -> Settings:
@@ -103,6 +107,23 @@ def load_settings(require_token: bool = True) -> Settings:
     if not db_path.is_absolute():
         db_path = BASE_DIR / db_path
 
+    max_admin_ids = []
+    for part in _str("MAX_ADMIN_ID").replace(";", ",").split(","):
+        part = part.strip()
+        if part:
+            try:
+                max_admin_ids.append(int(part))
+            except ValueError:
+                raise SystemExit(f"MAX_ADMIN_ID должен быть числом (или числами через запятую), сейчас: {part!r}")
+    max_raw = _str("MAX_DB_PATH")
+    if max_raw:
+        max_db_path = Path(max_raw)
+    else:
+        data_dir = _str("DATA_DIR")
+        max_db_path = (Path(data_dir) if data_dir else BASE_DIR / "data") / "max_bot.sqlite3"
+    if not max_db_path.is_absolute():
+        max_db_path = BASE_DIR / max_db_path
+
     return Settings(
         bot_token=token,
         admin_ids=admin_ids,
@@ -122,4 +143,7 @@ def load_settings(require_token: bool = True) -> Settings:
         scheduler_interval_seconds=_int("SCHEDULER_INTERVAL_SECONDS", 60) or 60,
         broadcast_rate_per_sec=min(max(_float("BROADCAST_RATE_PER_SEC", 15), 0.5), 20),
         db_path=db_path,
+        max_bot_token=_str("MAX_BOT_TOKEN"),
+        max_admin_ids=max_admin_ids,
+        max_db_path=max_db_path,
     )

@@ -318,6 +318,8 @@ def test_start_without_payload_shows_menu_only_after_consent():
         app.accept_mailing(7, False)
         await app.finish_and_deliver(7, user)
         assert "Что вам прислать?" in bot.out[-1]["text"]
+        assert "Здравствуйте! Я бот Елены Тимошенко" not in bot.out[-1]["text"]
+        assert bot.out[-1]["text"].startswith("Помогаю селлерам WB и Ozon")
         assert app.db.has_event(7, "start")
 
     asyncio.run(run())
