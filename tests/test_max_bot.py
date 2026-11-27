@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import datetime, timedelta, timezone
 
 from bot import CB_MAIL_NO, CB_MAIL_YES, CB_PD
@@ -280,6 +281,106 @@ def test_start_without_payload_shows_choice_after_consent():
         assert buttons_of(rec)[-1][0][0]["payload"] == "lead:utechki"
 
     asyncio.run(run())
+
+
+class WebhookAPI:
+    """Память подписок: GET отдаёт список, DELETE снимает url."""
+
+    def __init__(self, subs, fail_delete=None, fail_get=False):
+        self.subs = list(subs)
+        self.fail_delete = set(fail_delete or [])
+        self.fail_get = fail_get
+        self.calls = []
+        self.gets = 0
+
+    async def __call__(self, method, path, params, body, headers):
+        self.calls.append({"method": method, "path": path, "params": params})
+        if path != "/subscriptions":
+            return 200, {}
+        if method == "GET":
+            self.gets += 1
+            if self.fail_get and self.gets == 1:
+                return 500, {"code": "internal", "message": "временно недоступно"}
+            return 200, {"subscriptions": [{"url": url} for url in self.subs]}
+        if method == "DELETE":
+            url = (params or {}).get("url")
+            if url in self.fail_delete:
+                return 200, {"success": False, "code": "not.found", "message": "нет такой подписки"}
+            self.subs = [item for item in self.subs if item != url]
+            return 200, {"success": True}
+        return 200, {}
+
+
+def _app_with(api: WebhookAPI) -> MaxApp:
+    client = MaxClient("max-secret-token", transport=api)
+    return MaxApp(settings(), TEXTS, DB(":memory:"), client)
+
+
+def test_startup_deletes_every_webhook_then_checks_the_list_is_empty(caplog):
+    xl = "https://cht-xl.xlcrm.ai/api/v1/channel-webhook/max/MzM2NTg1ODIw"
+    other = "https://example.com/hook"
+    api = WebhookAPI([xl, other])
+    app = _app_with(api)
+
+    async def run():
+        with caplog.at_level(logging.INFO, logger="max_bot"):
+            await app.prepare_updates()
+
+    asyncio.run(run())
+    deleted = [call["params"]["url"] for call in api.calls if call["method"] == "DELETE"]
+    assert deleted == [xl, other]
+    assert api.subs == []
+    assert api.gets == 2
+    assert f"Удалена подписка Webhook: {xl}" in caplog.text
+    assert f"Удалена подписка Webhook: {other}" in caplog.text
+    assert "Подписок Webhook нет" in caplog.text
+
+
+def test_delete_error_does_not_stop_the_rest(caplog):
+    keep = "https://example.com/stuck"
+    gone = "https://example.com/ok"
+    api = WebhookAPI([keep, gone], fail_delete={keep})
+    app = _app_with(api)
+
+    async def run():
+        with caplog.at_level(logging.INFO, logger="max_bot"):
+            await app.prepare_updates()
+
+    asyncio.run(run())
+    assert api.subs == [keep]
+    assert f"Удалена подписка Webhook: {gone}" in caplog.text
+    assert "Не удалось удалить Webhook" in caplog.text
+    assert keep in caplog.text
+    assert "Подписки Webhook остались" in caplog.text
+
+
+def test_list_error_is_logged_and_polling_setup_continues(caplog):
+    api = WebhookAPI(["https://example.com/hook"], fail_get=True)
+    app = _app_with(api)
+
+    async def run():
+        with caplog.at_level(logging.WARNING, logger="max_bot"):
+            await app.prepare_updates()
+
+    asyncio.run(run())
+    assert not any(call["method"] == "DELETE" for call in api.calls)
+    assert "Не удалось получить подписки Webhook" in caplog.text
+
+
+def test_keep_webhooks_env_does_not_delete(monkeypatch, caplog):
+    monkeypatch.setenv("MAX_KEEP_WEBHOOKS", "1")
+    api = WebhookAPI(["https://example.com/hook"])
+    app = _app_with(api)
+
+    async def run():
+        with caplog.at_level(logging.INFO, logger="max_bot"):
+            await app.prepare_updates()
+
+    asyncio.run(run())
+    assert not any(call["method"] == "DELETE" for call in api.calls)
+    assert api.subs == ["https://example.com/hook"]
+    assert "MAX_KEEP_WEBHOOKS=1" in caplog.text
+    assert "У бота есть Webhook" in caplog.text
 
 
 def test_document_links_stay_on_consent_screens():

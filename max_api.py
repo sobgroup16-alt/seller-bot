@@ -172,6 +172,10 @@ class MaxClient:
             return list(data.get("subscriptions") or [])
         return []
 
+    async def delete_subscription(self, url: str) -> None:
+        """DELETE /subscriptions?url=... Снимает один Webhook, после этого снова доступен long polling."""
+        await self.request("DELETE", "/subscriptions", params={"url": url})
+
     async def get_updates(self, *, marker: int | None = None, timeout: int = 25,
                           limit: int = 100, types: list[str] | None = None) -> dict:
         params: dict[str, Any] = {"timeout": timeout, "limit": limit}

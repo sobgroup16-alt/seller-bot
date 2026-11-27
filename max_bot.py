@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import os
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -607,22 +608,51 @@ class MaxApp:
         return "\n".join(lines)
 
     # ---------- long polling ----------
-    async def warn_if_webhook(self) -> None:
+    async def prepare_updates(self) -> None:
+        """Снимает чужие Webhook, иначе long polling молчит. MAX_KEEP_WEBHOOKS=1 оставляет их."""
+        if _keep_webhooks():
+            log.info("MAX_KEEP_WEBHOOKS=1: существующие Webhook не удаляются")
+            await self._warn_if_webhook()
+            return
         try:
             subs = await self.api.get_subscriptions()
-        except MaxApiError as err:
+        except Exception as err:  # noqa: BLE001
+            log.warning("Не удалось получить подписки Webhook, продолжаю: %s", err)
+            return
+        for url in _subscription_urls(subs):
+            try:
+                await self.api.delete_subscription(url)
+            except Exception as err:  # noqa: BLE001
+                log.warning("Не удалось удалить Webhook %s, продолжаю: %s", url, err)
+                continue
+            log.info("Удалена подписка Webhook: %s", url)
+        try:
+            left = await self.api.get_subscriptions()
+        except Exception as err:  # noqa: BLE001
+            log.warning("Не удалось проверить список подписок после удаления: %s", err)
+            return
+        rest = _subscription_urls(left)
+        if rest:
+            log.warning("Подписки Webhook остались, long polling может не получать события: %s", ", ".join(rest))
+        else:
+            log.info("Подписок Webhook нет")
+
+    async def _warn_if_webhook(self) -> None:
+        try:
+            subs = await self.api.get_subscriptions()
+        except Exception as err:  # noqa: BLE001
             log.warning("Не удалось проверить подписки Webhook: %s", err)
             return
-        if subs:
+        urls = _subscription_urls(subs)
+        if urls:
             log.warning(
-                "У бота есть Webhook (%s). Пока подписка активна, long polling события не получает. "
-                "Официально для продакшена нужен Webhook: https://dev.max.ru/docs-api/methods/POST/subscriptions",
-                ", ".join(str(item.get("url") or item) for item in subs if isinstance(item, dict)) or "да",
+                "У бота есть Webhook (%s). Пока подписка активна, long polling события не получает.",
+                ", ".join(urls),
             )
 
     async def poll_forever(self, marker_path: Path) -> None:
         marker = _read_marker(marker_path)
-        await self.warn_if_webhook()
+        await self.prepare_updates()
         while True:
             try:
                 page = await self.api.get_updates(marker=marker, timeout=25, types=UPDATE_TYPES)
@@ -645,6 +675,20 @@ class MaxApp:
             if page.get("marker") is not None:
                 marker = page["marker"]
                 _write_marker(marker_path, marker)
+
+
+def _keep_webhooks() -> bool:
+    return os.getenv("MAX_KEEP_WEBHOOKS", "").strip().lower() in {"1", "true", "yes", "on", "да"}
+
+
+def _subscription_urls(subs: list) -> list[str]:
+    urls = []
+    for item in subs or []:
+        if isinstance(item, dict) and item.get("url"):
+            urls.append(str(item["url"]))
+        elif isinstance(item, str) and item:
+            urls.append(item)
+    return urls
 
 
 def _media_attachment(attachments: list | None) -> dict | None:
